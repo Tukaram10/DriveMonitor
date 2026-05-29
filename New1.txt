@@ -1,0 +1,527 @@
+
+using System;
+using System.Configuration;
+using System.IO;
+using System.Reflection;
+using System.ServiceProcess;
+using System.Text;
+using System.Threading;
+using Npgsql;
+
+namespace DriveMonitorService
+{
+    public partial class BlacklistTrunService : ServiceBase
+    {
+        private Thread workerThread;
+
+        public BlacklistTrunService()
+        {
+            ServiceName = "BlacklistTrunService";
+        }
+
+        protected override void OnStart(string[] args)
+        {
+            WriteLog("====================================");
+            WriteLog("SERVICE STARTED");
+
+            string version =
+                Assembly.GetExecutingAssembly()
+                .GetName()
+                .Version
+                .ToString();
+
+            WriteLog("SERVICE VERSION : " + version);
+
+            workerThread = new Thread(ServiceLoop);
+            workerThread.IsBackground = true;
+            workerThread.Start();
+        }
+
+        protected override void OnStop()
+        {
+            WriteLog("SERVICE STOPPED");
+            WriteLog("====================================");
+        }
+
+        private void ServiceLoop()
+        {
+            while (true)
+            {
+                try
+                {
+                    CheckDriveSpace();
+                }
+                catch (Exception ex)
+                {
+                    WriteLog("MAIN LOOP ERROR : " + ex.Message);
+                }
+
+                Thread.Sleep(300000);
+            }
+        }
+
+        static void CheckDriveSpace()
+        {
+            try
+            {
+                string monitorDrive =
+                    ConfigurationManager.AppSettings["MONITOR_DRIVE"];
+
+                int minSpaceGB =
+                    Convert.ToInt32(
+                        ConfigurationManager.AppSettings["MIN_DRIVE_SPACE_GB"]);
+
+                DriveInfo drive =
+                    new DriveInfo(monitorDrive);
+
+                double freeGB =
+                    drive.AvailableFreeSpace /
+                    1024.0 / 1024.0 / 1024.0;
+
+                WriteLog("CURRENT FREE SPACE : "
+                         + freeGB.ToString("0.00")
+                         + " GB");
+
+                if (freeGB < minSpaceGB)
+                {
+                    WriteLog("DRIVE SPACE BELOW THRESHOLD");
+
+                    CheckAndTruncateTables();
+
+                    DeleteOldImageData();
+                }
+                else
+                {
+                    WriteLog("DRIVE SPACE IS OK");
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteLog("CHECK DRIVE ERROR : "
+                         + ex.Message);
+            }
+        }
+
+        static void CheckAndTruncateTables()
+        {
+            try
+            {
+                WriteLog("====================================");
+                WriteLog("BLACKLIST CLEANUP STARTED");
+
+                string connectionString =
+                    GetConnectionString();
+
+                string runningTable = "";
+
+                using (NpgsqlConnection conn =
+                    new NpgsqlConnection(connectionString))
+                {
+                    conn.Open();
+
+                    WriteLog("DATABASE CONNECTED");
+
+                    string[] tables =
+                    {
+                        ConfigurationManager.AppSettings["BLACKLIST_TABLE_1"],
+                        ConfigurationManager.AppSettings["BLACKLIST_TABLE_2"],
+                        ConfigurationManager.AppSettings["BLACKLIST_TABLE_3"]
+                    };
+
+                    // TABLE STRUCTURE LOG
+                    foreach (string tbl in tables)
+                    {
+                        try
+                        {
+                            WriteLog("------------------------------------");
+                            WriteLog("CHECKING TABLE : " + tbl);
+
+                            string structureQuery = @"
+                                SELECT
+                                    column_name,
+                                    data_type
+                                FROM information_schema.columns
+                                WHERE table_name = @tableName
+                                ORDER BY ordinal_position";
+
+                            using (NpgsqlCommand cmd =
+                                new NpgsqlCommand(
+                                    structureQuery,
+                                    conn))
+                            {
+                                cmd.Parameters.AddWithValue(
+                                    "@tableName",
+                                    tbl.ToLower());
+
+                                using (NpgsqlDataReader reader =
+                                    cmd.ExecuteReader())
+                                {
+                                    while (reader.Read())
+                                    {
+                                        WriteLog(
+                                            "COLUMN : "
+                                            + reader["column_name"]
+                                            + " | TYPE : "
+                                            + reader["data_type"]);
+                                    }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            WriteLog("STRUCTURE ERROR : "
+                                     + ex.Message);
+                        }
+                    }
+
+                    // GET CURRENT TABLE
+                    WriteLog("------------------------------------");
+                    WriteLog("CHECKING CURRENT RUNNING TABLE");
+
+                    string query = @"
+                        SELECT current_blacklist_table
+                        FROM tbl_blacklist_config
+                        LIMIT 1";
+
+                    using (NpgsqlCommand cmd =
+                        new NpgsqlCommand(query, conn))
+                    {
+                        object result =
+                            cmd.ExecuteScalar();
+
+                        if (result != null)
+                        {
+                            runningTable =
+                                result.ToString();
+                        }
+                    }
+
+                    WriteLog("CURRENT RUNNING TABLE : "
+                             + runningTable);
+
+                    // TRUNCATE OTHER TABLES
+                    foreach (string table in tables)
+                    {
+                        try
+                        {
+                            WriteLog("------------------------------------");
+                            WriteLog("PROCESSING TABLE : "
+                                     + table);
+
+                            if (table == runningTable)
+                            {
+                                WriteLog("SKIPPED CURRENT TABLE : "
+                                         + table);
+
+                                continue;
+                            }
+
+                            long beforeCount = 0;
+
+                            string countQuery =
+                                "SELECT COUNT(*) FROM "
+                                + table;
+
+                            using (NpgsqlCommand countCmd =
+                                new NpgsqlCommand(
+                                    countQuery,
+                                    conn))
+                            {
+                                beforeCount =
+                                    Convert.ToInt64(
+                                        countCmd.ExecuteScalar());
+                            }
+
+                            WriteLog("ROW COUNT BEFORE : "
+                                     + beforeCount);
+
+                            // TRUNCATE
+                            string truncateQuery =
+                                "TRUNCATE TABLE "
+                                + table;
+
+                            using (NpgsqlCommand truncateCmd =
+                                new NpgsqlCommand(
+                                    truncateQuery,
+                                    conn))
+                            {
+                                truncateCmd.ExecuteNonQuery();
+                            }
+
+                            WriteLog("TRUNCATED TABLE : "
+                                     + table);
+
+                            // VACUUM
+                            string vacuumQuery =
+                                "VACUUM " + table;
+
+                            using (NpgsqlCommand vacuumCmd =
+                                new NpgsqlCommand(
+                                    vacuumQuery,
+                                    conn))
+                            {
+                                vacuumCmd.ExecuteNonQuery();
+                            }
+
+                            WriteLog("VACUUM COMPLETED : "
+                                     + table);
+
+                            long afterCount = 0;
+
+                            using (NpgsqlCommand countCmd2 =
+                                new NpgsqlCommand(
+                                    countQuery,
+                                    conn))
+                            {
+                                afterCount =
+                                    Convert.ToInt64(
+                                        countCmd2.ExecuteScalar());
+                            }
+
+                            WriteLog("ROW COUNT AFTER : "
+                                     + afterCount);
+                        }
+                        catch (Exception ex)
+                        {
+                            WriteLog("TABLE ERROR : "
+                                     + table
+                                     + " : "
+                                     + ex.Message);
+                        }
+                    }
+
+                    conn.Close();
+
+                    WriteLog("DATABASE CONNECTION CLOSED");
+                    WriteLog("BLACKLIST CLEANUP COMPLETED");
+                    WriteLog("====================================");
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteLog("BLACKLIST ERROR : "
+                         + ex.Message);
+            }
+        }
+
+        static void DeleteOldImageData()
+        {
+            try
+            {
+                WriteLog("====================================");
+                WriteLog("IMAGE DELETE PROCESS STARTED");
+
+                string connectionString =
+                    GetConnectionString();
+
+                using (NpgsqlConnection conn =
+                    new NpgsqlConnection(connectionString))
+                {
+                    conn.Open();
+
+                    WriteLog("DATABASE CONNECTED");
+
+                    DateTime currentDate =
+                        DateTime.Now;
+
+                    DateTime deleteTillDate =
+                        currentDate.AddMonths(-3);
+
+                    DateTime startDate =
+                        new DateTime(2000, 1, 1);
+
+                    DateTime endDate =
+                        new DateTime(
+                            deleteTillDate.Year,
+                            deleteTillDate.Month,
+                            DateTime.DaysInMonth(
+                                deleteTillDate.Year,
+                                deleteTillDate.Month));
+
+                    WriteLog("DELETE START DATE : "
+                             + startDate.ToString("yyyy-MM-dd"));
+
+                    WriteLog("DELETE END DATE : "
+                             + endDate.ToString("yyyy-MM-dd"));
+
+                    string countQuery = @"
+                        SELECT COUNT(*)
+                        FROM tbl_images_postdata
+                        WHERE shift_date BETWEEN
+                        @startDate AND @endDate";
+
+                    long totalRows = 0;
+
+                    using (NpgsqlCommand countCmd =
+                        new NpgsqlCommand(
+                            countQuery,
+                            conn))
+                    {
+                        countCmd.Parameters.AddWithValue(
+                            "@startDate",
+                            startDate);
+
+                        countCmd.Parameters.AddWithValue(
+                            "@endDate",
+                            endDate);
+
+                        totalRows =
+                            Convert.ToInt64(
+                                countCmd.ExecuteScalar());
+                    }
+
+                    WriteLog("TOTAL OLD RECORDS : "
+                             + totalRows);
+
+                    if (totalRows > 0)
+                    {
+                        string deleteQuery = @"
+                            DELETE FROM tbl_images_postdata
+                            WHERE shift_date BETWEEN
+                            @startDate AND @endDate";
+
+                        using (NpgsqlCommand deleteCmd =
+                            new NpgsqlCommand(
+                                deleteQuery,
+                                conn))
+                        {
+                            deleteCmd.Parameters.AddWithValue(
+                                "@startDate",
+                                startDate);
+
+                            deleteCmd.Parameters.AddWithValue(
+                                "@endDate",
+                                endDate);
+
+                            int deletedRows =
+                                deleteCmd.ExecuteNonQuery();
+
+                            WriteLog("TOTAL DELETED : "
+                                     + deletedRows);
+                        }
+
+                        // VACUUM
+                        string vacuumQuery =
+                            "VACUUM tbl_images_postdata";
+
+                        using (NpgsqlCommand vacuumCmd =
+                            new NpgsqlCommand(
+                                vacuumQuery,
+                                conn))
+                        {
+                            vacuumCmd.ExecuteNonQuery();
+                        }
+
+                        WriteLog("VACUUM COMPLETED FOR IMAGE TABLE");
+                    }
+                    else
+                    {
+                        WriteLog("NO OLD IMAGE DATA FOUND");
+                    }
+
+                    conn.Close();
+
+                    WriteLog("DATABASE CONNECTION CLOSED");
+                    WriteLog("IMAGE DELETE PROCESS COMPLETED");
+                    WriteLog("====================================");
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteLog("IMAGE DELETE ERROR : "
+                         + ex.Message);
+            }
+        }
+
+        static string GetConnectionString()
+        {
+            string dbServerIp =
+                ConfigurationManager.AppSettings["DB_SERVER_IP"];
+
+            string dbPort =
+                ConfigurationManager.AppSettings["DB_SERVER_PORT"];
+
+            string dbName =
+                ConfigurationManager.AppSettings["DB_NAME"];
+
+            string dbUser =
+                ConfigurationManager.AppSettings["DB_SERVER_USER"];
+
+            string encryptedPassword =
+                ConfigurationManager.AppSettings["DB_SERVER_PASSWORD"];
+
+            string dbPassword =
+                DecryptPassword(encryptedPassword);
+
+            return
+                "Host=" + dbServerIp +
+                ";Port=" + dbPort +
+                ";Database=" + dbName +
+                ";Username=" + dbUser +
+                ";Password=" + dbPassword;
+        }
+
+        static string DecryptPassword(
+            string encryptedPassword)
+        {
+            try
+            {
+                byte[] data =
+                    Convert.FromBase64String(
+                        encryptedPassword);
+
+                return Encoding.UTF8.GetString(data);
+            }
+            catch
+            {
+                return encryptedPassword;
+            }
+        }
+
+        static void WriteLog(string message)
+        {
+            try
+            {
+                string logFolder =
+                    ConfigurationManager.AppSettings["LOG_FOLDER"];
+
+                string logFileName =
+                    ConfigurationManager.AppSettings["LOG_FILE_NAME"];
+
+                string logPath =
+                    Path.Combine(
+                        logFolder,
+                        logFileName);
+
+                if (!Directory.Exists(logFolder))
+                {
+                    Directory.CreateDirectory(logFolder);
+                }
+
+                using (StreamWriter sw =
+                    new StreamWriter(logPath, true))
+                {
+                    string logLine =
+                        "°10°"
+                        + DateTime.Now.ToString(
+                            "dd/MM/yyyy HH:mm:ss")
+                        + "° "
+                        + message;
+
+                    sw.WriteLine(logLine);
+                }
+            }
+            catch
+            {
+
+            }
+        }
+
+        static void Main()
+        {
+            ServiceBase.Run(
+                new BlacklistTrunService());
+        }
+    }
+}
+
