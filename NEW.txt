@@ -1,0 +1,334 @@
+
+using System;
+using System.Configuration;
+using System.IO;
+using System.Reflection;
+using System.ServiceProcess;
+using System.Text;
+using System.Threading;
+using Npgsql;
+
+namespace DriveMonitorService
+{
+    public partial class BlacklistTrunService : ServiceBase
+    {
+        private Thread workerThread;
+
+        public BlacklistTrunService()
+        {
+            ServiceName = "BlacklistTrunService";
+        }
+
+        protected override void OnStart(string[] args)
+        {
+            WriteLog("========== SERVICE STARTED ==========");
+
+            string version =
+                Assembly.GetExecutingAssembly()
+                .GetName()
+                .Version
+                .ToString();
+
+            WriteLog("SERVICE VERSION : " + version);
+
+            workerThread = new Thread(ServiceLoop);
+            workerThread.IsBackground = true;
+            workerThread.Start();
+        }
+
+        protected override void OnStop()
+        {
+            WriteLog("========== SERVICE STOPPED ==========");
+        }
+
+        private void ServiceLoop()
+        {
+            while (true)
+            {
+                try
+                {
+                    CheckDriveSpace();
+                }
+                catch (Exception ex)
+                {
+                    WriteLog("MAIN LOOP ERROR : " + ex.Message);
+                }
+
+                Thread.Sleep(300000);
+            }
+        }
+
+        static void CheckDriveSpace()
+        {
+            try
+            {
+                string monitorDrive =
+                    ConfigurationManager.AppSettings["MONITOR_DRIVE"];
+
+                int minSpaceGB =
+                    Convert.ToInt32(
+                        ConfigurationManager.AppSettings["MIN_DRIVE_SPACE_GB"]);
+
+                DriveInfo drive =
+                    new DriveInfo(monitorDrive);
+
+                double freeGB =
+                    drive.AvailableFreeSpace /
+                    1024.0 / 1024.0 / 1024.0;
+
+                WriteLog("Current Free Space : "
+                         + freeGB.ToString("0.00") + " GB");
+
+                if (freeGB < minSpaceGB)
+                {
+                    WriteLog("Drive Space Below Threshold");
+
+                    CheckAndTruncateTables();
+                }
+            }
+            catch (Exception ex)
+            {
+                WriteLog("CHECK DRIVE ERROR : " + ex.Message);
+            }
+        }
+
+    
+static void CheckAndTruncateTables()
+{
+    try
+    {
+        WriteLog("====================================");
+        WriteLog("DATABASE OPERATION STARTED");
+
+        string dbServerIp =
+            ConfigurationManager.AppSettings["DB_SERVER_IP"];
+
+        string dbPort =
+            ConfigurationManager.AppSettings["DB_SERVER_PORT"];
+
+        string dbName =
+            ConfigurationManager.AppSettings["DB_NAME"];
+
+        string dbUser =
+            ConfigurationManager.AppSettings["DB_SERVER_USER"];
+
+        string encryptedPassword =
+            ConfigurationManager.AppSettings["DB_SERVER_PASSWORD"];
+
+        string dbPassword =
+            DecryptPassword(encryptedPassword);
+
+        string connectionString =
+            "Host=" + dbServerIp +
+            ";Port=" + dbPort +
+            ";Database=" + dbName +
+            ";Username=" + dbUser +
+            ";Password=" + dbPassword;
+
+        WriteLog("DB SERVER IP : " + dbServerIp);
+        WriteLog("DB PORT      : " + dbPort);
+        WriteLog("DB NAME      : " + dbName);
+        WriteLog("DB USER      : " + dbUser);
+
+        string runningTable = "";
+
+        using (NpgsqlConnection conn =
+            new NpgsqlConnection(connectionString))
+        {
+            conn.Open();
+
+            WriteLog("DATABASE CONNECTED SUCCESSFULLY");
+
+            // ====================================
+            // CHECK TABLE STRUCTURE
+            // ====================================
+
+            string[] tables =
+            {
+                ConfigurationManager.AppSettings["BLACKLIST_TABLE_1"],
+                ConfigurationManager.AppSettings["BLACKLIST_TABLE_2"],
+                ConfigurationManager.AppSettings["BLACKLIST_TABLE_3"]
+            };
+
+            foreach (string tbl in tables)
+            {
+                try
+                {
+                    WriteLog("------------------------------------");
+                    WriteLog("CHECKING TABLE STRUCTURE : " + tbl);
+
+                    string structureQuery = @"
+                        SELECT
+                            column_name,
+                            data_type
+                        FROM information_schema.columns
+                        WHERE table_name = @tableName
+                        ORDER BY ordinal_position";
+
+                    using (NpgsqlCommand structureCmd =
+                        new NpgsqlCommand(structureQuery, conn))
+                    {
+                        structureCmd.Parameters.AddWithValue(
+                            "@tableName",
+                            tbl.ToLower());
+
+                        using (NpgsqlDataReader reader =
+                            structureCmd.ExecuteReader())
+                        {
+                            while (reader.Read())
+                            {
+                                string columnName =
+                                    reader["column_name"].ToString();
+
+                                string dataType =
+                                    reader["data_type"].ToString();
+
+                                WriteLog(
+                                    "COLUMN : "
+                                    + columnName
+                                    + " | TYPE : "
+                                    + dataType);
+                            }
+                        }
+                    }
+
+                    WriteLog("TABLE STRUCTURE CHECK COMPLETED : "
+                             + tbl);
+                }
+                catch (Exception ex)
+                {
+                    WriteLog("STRUCTURE CHECK ERROR : "
+                             + tbl
+                             + " : "
+                             + ex.Message);
+                }
+            }
+
+            // ====================================
+            // GET CURRENT RUNNING TABLE
+            // ====================================
+
+            WriteLog("------------------------------------");
+            WriteLog("CHECKING CURRENT RUNNING TABLE");
+
+            string query = @"
+                SELECT current_blacklist_table
+                FROM tbl_blacklist_config
+                LIMIT 1";
+
+            using (NpgsqlCommand cmd =
+                new NpgsqlCommand(query, conn))
+            {
+                object result = cmd.ExecuteScalar();
+
+                if (result != null)
+                {
+                    runningTable = result.ToString();
+                }
+            }
+
+            WriteLog("CURRENT RUNNING TABLE : "
+                     + runningTable);
+
+            // ====================================
+            // TRUNCATE OTHER TABLES
+            // ====================================
+
+            foreach (string table in tables)
+            {
+                try
+                {
+                    WriteLog("------------------------------------");
+                    WriteLog("PROCESSING TABLE : " + table);
+
+                    if (table == runningTable)
+                    {
+                        WriteLog("SKIPPED CURRENT RUNNING TABLE : "
+                                 + table);
+
+                        continue;
+                    }
+
+                    // ROW COUNT BEFORE
+                    long beforeCount = 0;
+
+                    string countQuery =
+                        "SELECT COUNT(*) FROM " + table;
+
+                    using (NpgsqlCommand countCmd =
+                        new NpgsqlCommand(countQuery, conn))
+                    {
+                        beforeCount =
+                            Convert.ToInt64(
+                                countCmd.ExecuteScalar());
+                    }
+
+                    WriteLog("ROW COUNT BEFORE TRUNCATE : "
+                             + beforeCount);
+
+                    // TRUNCATE TABLE
+                    string truncateQuery =
+                        "TRUNCATE TABLE " + table;
+
+                    using (NpgsqlCommand truncateCmd =
+                        new NpgsqlCommand(truncateQuery, conn))
+                    {
+                        truncateCmd.ExecuteNonQuery();
+                    }
+
+                    WriteLog("TABLE TRUNCATED SUCCESSFULLY : "
+                             + table);
+
+                    // VACUUM TABLE
+                    string vacuumQuery =
+                        "VACUUM " + table;
+
+                    using (NpgsqlCommand vacuumCmd =
+                        new NpgsqlCommand(vacuumQuery, conn))
+                    {
+                        vacuumCmd.ExecuteNonQuery();
+                    }
+
+                    WriteLog("VACUUM COMPLETED : " + table);
+
+                    // ROW COUNT AFTER
+                    long afterCount = 0;
+
+                    using (NpgsqlCommand countCmd2 =
+                        new NpgsqlCommand(countQuery, conn))
+                    {
+                        afterCount =
+                            Convert.ToInt64(
+                                countCmd2.ExecuteScalar());
+                    }
+
+                    WriteLog("ROW COUNT AFTER TRUNCATE : "
+                             + afterCount);
+
+                    WriteLog("TABLE CLEANUP COMPLETED : "
+                             + table);
+                }
+                catch (Exception ex)
+                {
+                    WriteLog("TABLE PROCESS ERROR : "
+                             + table
+                             + " : "
+                             + ex.Message);
+                }
+            }
+
+            conn.Close();
+
+            WriteLog("DATABASE CONNECTION CLOSED");
+            WriteLog("DATABASE OPERATION COMPLETED");
+            WriteLog("====================================");
+        }
+    }
+    catch (Exception ex)
+    {
+        WriteLog("DATABASE MAIN ERROR : "
+                 + ex.Message);
+    }
+}
+
+
